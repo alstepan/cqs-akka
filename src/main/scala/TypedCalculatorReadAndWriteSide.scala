@@ -1,5 +1,4 @@
-import akka.NotUsed
-import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.{Done, NotUsed}
 import akka.actor.typed.{ActorSystem, Props, _}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
@@ -13,12 +12,14 @@ import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{Flow, Sink, Source}
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
+import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
 import akka_typed.CalculatorRepository.{getLatestOffsetAndResult, initDataBase, updateResultAndOfsset}
 import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiplied, Multiply}
 
+import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.io.StdIn
 import scala.util.{Failure, Success}
@@ -113,11 +114,13 @@ object akka_typed
   case class TypedCalculatorReadSide(system: ActorSystem[NotUsed]) {
     initDataBase
 
-    implicit val materializer            = system.classicSystem
+    implicit val materializer           = system.classicSystem
+    implicit val session                = SlickSession.forConfig("slick-postgres")
+
+    val profile                         = slick.jdbc.PostgresProfile
     var (offset, latestCalculatedResult) = getLatestOffsetAndResult
     val startOffset: Int                 = if (offset == 1) 1 else offset + 1
 
-//    val readJournal: LeveldbReadJournal =
     val readJournal: CassandraReadJournal =
       PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
 
@@ -136,30 +139,38 @@ object akka_typed
     val source: Source[EventEnvelope, NotUsed] = readJournal
       .eventsByPersistenceId("001", startOffset, Long.MaxValue)
 
+    val businessFlow: Flow[EventEnvelope, (EventEnvelope, Double), NotUsed] = Flow[EventEnvelope]
+      .map(e => e.event match {
+        case Added(_, amount) =>
+          latestCalculatedResult += amount
+          (e, latestCalculatedResult)
+        case Multiplied(_, amount) =>
+          latestCalculatedResult *= amount
+          (e, latestCalculatedResult)
+        case Divided(_, amount) =>
+          latestCalculatedResult /= amount
+          (e, latestCalculatedResult)
+      })
+
+    import session.profile.api._
+    val slickSink: Sink[(EventEnvelope, Double), Future[Done]] = Slick.sink[(EventEnvelope, Double)]{
+      (x: (EventEnvelope, Double)) => {
+        println(s"Calculated value to save into the database: ${x._2}, sequence number: ${x._1.sequenceNr}")
+        sqlu"update public.result set calculated_value = ${x._2}, write_side_offset = ${x._1.sequenceNr} where id = 1"
+      }
+    }
+
     source
       .map{x =>
         println(x.toString())
         x
       }
-      .runForeach { event =>
-      event.event match {
-        case Added(_, amount) =>
-//          println(s"!Before Log from Added: $latestCalculatedResult")
-          latestCalculatedResult += amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Added: $latestCalculatedResult")
-        case Multiplied(_, amount) =>
-//          println(s"!Before Log from Multiplied: $latestCalculatedResult")
-          latestCalculatedResult *= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Multiplied: $latestCalculatedResult")
-        case Divided(_, amount) =>
-//          println(s"! Log from Divided before: $latestCalculatedResult")
-          latestCalculatedResult /= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Divided: $latestCalculatedResult")
+      .via(businessFlow.async)
+      .map{ x =>
+        println(s"result after: ${x._2}"); x
       }
-    }
+      .to(slickSink.async)
+      .run()
   }
 
   object CalculatorRepository {
@@ -196,9 +207,9 @@ object akka_typed
     Behaviors.setup { ctx =>
       val writeActorRef = ctx.spawn(TypedCalculatorWriteSide(), "Calculato", Props.empty)
 
-//      writeActorRef ! Add(10)
-//      writeActorRef ! Multiply(2)
-//      writeActorRef ! Divide(5)
+      writeActorRef ! Add(10)
+      writeActorRef ! Multiply(2)
+      writeActorRef ! Divide(5)
 
       // 0 + 10 = 10
       // 10 * 2 = 20
