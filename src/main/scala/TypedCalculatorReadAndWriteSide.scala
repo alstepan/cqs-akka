@@ -1,5 +1,4 @@
-import akka.NotUsed
-import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.{Done, NotUsed}
 import akka.actor.typed.{ActorSystem, Props, _}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
@@ -13,12 +12,13 @@ import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{Flow, Sink, Source}
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
 import akka_typed.CalculatorRepository.{getLatestOffsetAndResult, initDataBase, updateResultAndOfsset}
 import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiplied, Multiply}
 
+import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.io.StdIn
 import scala.util.{Failure, Success}
@@ -113,53 +113,55 @@ object akka_typed
   case class TypedCalculatorReadSide(system: ActorSystem[NotUsed]) {
     initDataBase
 
-    implicit val materializer            = system.classicSystem
+    implicit val materializer           = system.classicSystem
+
     var (offset, latestCalculatedResult) = getLatestOffsetAndResult
     val startOffset: Int                 = if (offset == 1) 1 else offset + 1
 
-//    val readJournal: LeveldbReadJournal =
-    val readJournal: CassandraReadJournal =
-      PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
-
-
     /**
-     * В read side приложения с архитектурой CQRS (объект TypedCalculatorReadSide в TypedCalculatorReadAndWriteSide.scala) необходимо разделить бизнес логику и запись в целевой получатель, т.е.
-     * 1) Persistence Query должно находиться в Source
-     * 2) Обновление состояния необходимо переместить в отдельный от записи в БД флоу
-     * 3) ! Задание со звездочкой: вместо CalculatorRepository создать Sink c любой БД (например Postgres из docker-compose файла).
-     * Для последнего задания пригодится документация - https://doc.akka.io/docs/alpakka/current/slick.html#using-a-slick-flow-or-sink
-     * Результат выполненного д.з. необходимо оформить либо на github gist либо PR к текущему репозиторию.
+    В read side приложения с архитектурой CQRS (объект TypedCalculatorReadSide в TypedCalculatorReadAndWriteSide.scala) необходимо разделить чтение событий, бизнес логику и запись в целевой получатель и сделать их асинхронными, т.е.
+
+    1. Persistence Query должно находиться в Source
+    2. Обновление состояния необходимо переместить в отдельный от записи в БД flow, замкнуть пуcтым sink
+    Критерии оценки:
+    "Принято" - задание выполнено полностью
+    "Возвращено на доработку" - задание не выполнено полностью
      *
      * */
 
+    val source: Source[EventEnvelope, NotUsed] =
+      PersistenceQuery(system)
+        .readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
+        .eventsByPersistenceId("001", startOffset, Long.MaxValue)
 
-    val source: Source[EventEnvelope, NotUsed] = readJournal
-      .eventsByPersistenceId("001", startOffset, Long.MaxValue)
+    val businessFlow: Flow[EventEnvelope, (EventEnvelope, Double), NotUsed] = Flow[EventEnvelope]
+      .map(e => e.event match {
+        case Added(_, amount) =>
+          latestCalculatedResult += amount
+          (e, latestCalculatedResult)
+        case Multiplied(_, amount) =>
+          latestCalculatedResult *= amount
+          (e, latestCalculatedResult)
+        case Divided(_, amount) =>
+          latestCalculatedResult /= amount
+          (e, latestCalculatedResult)
+      })
+
+    val updateDBFlow = Flow[(EventEnvelope, Double)].map { e =>
+      updateResultAndOfsset(e._2, e._1.sequenceNr)
+      println(s"! Log from ${e._1.event}: ${e._2}")
+    }
 
     source
+      .async
       .map{x =>
         println(x.toString())
         x
       }
-      .runForeach { event =>
-      event.event match {
-        case Added(_, amount) =>
-//          println(s"!Before Log from Added: $latestCalculatedResult")
-          latestCalculatedResult += amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Added: $latestCalculatedResult")
-        case Multiplied(_, amount) =>
-//          println(s"!Before Log from Multiplied: $latestCalculatedResult")
-          latestCalculatedResult *= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Multiplied: $latestCalculatedResult")
-        case Divided(_, amount) =>
-//          println(s"! Log from Divided before: $latestCalculatedResult")
-          latestCalculatedResult /= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-          println(s"! Log from Divided: $latestCalculatedResult")
-      }
-    }
+      .via(businessFlow.async)
+      .via(updateDBFlow.async)
+      .runWith(Sink.ignore)
+
   }
 
   object CalculatorRepository {
@@ -196,9 +198,9 @@ object akka_typed
     Behaviors.setup { ctx =>
       val writeActorRef = ctx.spawn(TypedCalculatorWriteSide(), "Calculato", Props.empty)
 
-//      writeActorRef ! Add(10)
-//      writeActorRef ! Multiply(2)
-//      writeActorRef ! Divide(5)
+      writeActorRef ! Add(10)
+      writeActorRef ! Multiply(2)
+      writeActorRef ! Divide(5)
 
       // 0 + 10 = 10
       // 10 * 2 = 20
